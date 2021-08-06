@@ -1,24 +1,27 @@
 import { Config } from '@backstage/config';
 import {
-  GithubCredentialsProvider,
-  GithubCredentialType,
   ScmIntegrations,
 } from '@backstage/integration';
 import { LocationSpec } from '@backstage/catalog-model';
 import { CatalogProcessor, CatalogProcessorEmit, results } from '@backstage/plugin-catalog-backend';
 import { Logger } from 'winston';
+import { createGitHubClient, getGitHubConfig } from '../clients/github';
 import { graphql } from '@octokit/graphql';
 
-type GraphQL = typeof graphql;
-
-export class GithubOrganizationsProcessor implements CatalogProcessor {
+/**
+ * GitHubInstanceProcessor
+ *  Starting with an instance of a GitHub site, it creates a location for each organization.   
+ * 
+ * TODO: Effection here will be nice
+ */
+export class GitHubInstanceProcessor implements CatalogProcessor {
   private readonly integrations: ScmIntegrations;
   private readonly logger: Logger;
 
   static fromConfig(config: Config, options: { logger: Logger }) {
     const integrations = ScmIntegrations.fromConfig(config);
 
-    return new GithubOrganizationsProcessor({
+    return new GitHubInstanceProcessor({
       ...options,
       integrations,
     });
@@ -34,15 +37,20 @@ export class GithubOrganizationsProcessor implements CatalogProcessor {
     _optional: boolean,
     emit: CatalogProcessorEmit,
   ): Promise<boolean> {
-    if (location.type !== 'github-instance') {
+    if (location.type !== 'x-github-instance') {
       return false;
     }
 
-    const { client } = await this.createClient(location.target);
+    const orgUrl = location.target;
+
+    const gitHubConfig = getGitHubConfig(this.integrations, orgUrl)
+
+    // TODO: confirm that this will use GitHub App when available
+    const client = await createGitHubClient(orgUrl, gitHubConfig);
 
     const organizations = await queryOrganizations(client);
 
-    this.logger.info(`GithubOrganizationsProcessor: Found ${organizations.length} organizations`)
+    this.logger.info(`GitHubInstanceProcessor: Found ${organizations.length} organizations`)
 
     organizations.forEach((org) => {
       emit(results.location({
@@ -53,34 +61,6 @@ export class GithubOrganizationsProcessor implements CatalogProcessor {
 
     return true;
   }
-
-  private async createClient(
-    orgUrl: string,
-  ): Promise<{ client: GraphQL; tokenType: GithubCredentialType }> {
-    const gitHubConfig = this.integrations.github.byUrl(orgUrl)?.config;
-
-    if (!gitHubConfig) {
-      throw new Error(
-        `There is no GitHub Org provider that matches ${orgUrl}. Please add a configuration for an integration.`,
-      );
-    }
-
-    const credentialsProvider = GithubCredentialsProvider.create(gitHubConfig);
-    const {
-      headers,
-      type: tokenType,
-    } = await credentialsProvider.getCredentials({
-      url: orgUrl,
-    });
-
-    const client = graphql.defaults({
-      baseUrl: gitHubConfig.apiBaseUrl,
-      headers,
-    });
-
-    return { client, tokenType };
-  }
-
 }
 
 type Organization = {
