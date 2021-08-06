@@ -5,7 +5,7 @@ import {
 import { LocationSpec } from '@backstage/catalog-model';
 import { CatalogProcessor, CatalogProcessorEmit, results } from '@backstage/plugin-catalog-backend';
 import { Logger } from 'winston';
-import { createGitHubClient, getGitHubConfig } from '../clients/github';
+import { createGitHubClient, getGitHubConfig, getGitHubCredentials } from '../clients/github';
 import { graphql } from '@octokit/graphql';
 
 /**
@@ -45,8 +45,10 @@ export class GitHubInstanceProcessor implements CatalogProcessor {
 
     const gitHubConfig = getGitHubConfig(this.integrations, orgUrl)
 
+    const credentials = await getGitHubCredentials(orgUrl, gitHubConfig);
+
     // TODO: confirm that this will use GitHub App when available
-    const client = await createGitHubClient(orgUrl, gitHubConfig);
+    const client = await createGitHubClient(gitHubConfig, credentials);
 
     const organizations = await queryOrganizations(client);
 

@@ -1,37 +1,53 @@
 import {
   GithubCredentialsProvider,
+  GithubCredentialType,
   GitHubIntegrationConfig,
   ScmIntegrations,
 } from '@backstage/integration';
 import { graphql } from '@octokit/graphql';
+import { GroupEntity, UserEntity } from '@backstage/catalog-model';
 
-type GraphQL = typeof graphql;
+type Unpacked<T> =
+    T extends (infer U)[] ? U :
+    T extends (...args: any[]) => infer U ? U :
+    T extends Promise<infer U> ? U :
+    T;
+
+export type GraphQL = typeof graphql;
+export type GitHubCredentials = Unpacked<ReturnType<GithubCredentialsProvider['getCredentials']>>
+
+export async function getGitHubCredentials(
+  orgUrl: string,
+  gitHubConfig: GitHubIntegrationConfig,
+): Promise<GitHubCredentials> {
+  const credentialsProvider = GithubCredentialsProvider.create(gitHubConfig);
+  const credentials = await credentialsProvider.getCredentials(
+    {
+      url: orgUrl,
+    },
+  );
+
+  return credentials;
+}
 
 export async function createGitHubClient(
-    orgUrl: string,
-    gitHubConfig: GitHubIntegrationConfig
-  ): Promise<GraphQL> {
-    const credentialsProvider = GithubCredentialsProvider.create(gitHubConfig);
-    const {
-      headers,
-    } = await credentialsProvider.getCredentials({
-      url: orgUrl,
-    });
-
-    return graphql.defaults({
-      baseUrl: gitHubConfig.apiBaseUrl,
-      headers,
-    });
-  }
+  gitHubConfig: GitHubIntegrationConfig,
+  credentials: GitHubCredentials
+): Promise<GraphQL> {
+  return graphql.defaults({
+    baseUrl: gitHubConfig.apiBaseUrl,
+    headers: credentials.headers,
+  });
+}
 
 export function getGitHubConfig(integrations: ScmIntegrations, orgUrl: string) {
   const gitHubConfig = integrations.github.byUrl(orgUrl)?.config;
 
-    if (!gitHubConfig) {
-      throw new Error(
-        `There is no GitHub Org provider that matches ${orgUrl}. Please add a configuration for an integration.`,
-      );
-    }
+  if (!gitHubConfig) {
+    throw new Error(
+      `There is no GitHub Org provider that matches ${orgUrl}. Please add a configuration for an integration.`,
+    );
+  }
 
   return gitHubConfig;
 }
@@ -154,4 +170,246 @@ export async function queryWithPaging<
   }
 
   return result;
+}
+
+export function buildOrgHierarchy(groups: GroupEntity[]) {
+  const groupsByName = new Map(groups.map(g => [g.metadata.name, g]));
+
+  //
+  // Make sure that g.parent.children contain g
+  //
+
+  for (const group of groups) {
+    const selfName = group.metadata.name;
+    const parentName = group.spec.parent;
+    if (parentName) {
+      const parent = groupsByName.get(parentName);
+      if (parent && !parent.spec.children.includes(selfName)) {
+        parent.spec.children.push(selfName);
+      }
+    }
+  }
+
+  //
+  // Make sure that g.children.parent is g
+  //
+
+  for (const group of groups) {
+    const selfName = group.metadata.name;
+    for (const childName of group.spec.children) {
+      const child = groupsByName.get(childName);
+      if (child && !child.spec.parent) {
+        child.spec.parent = selfName;
+      }
+    }
+  }
+}
+
+/**
+ * Gets all the users out of a GitHub organization.
+ *
+ * Note that the users will not have their memberships filled in.
+ *
+ * @param client An octokit graphql client
+ * @param org The slug of the org to read
+ */
+export async function getOrganizationUsers(
+  client: typeof graphql,
+  org: string,
+  tokenType: GithubCredentialType,
+): Promise<{ users: UserEntity[] }> {
+  const query = `
+    query users($org: String!, $email: Boolean!, $cursor: String) {
+      organization(login: $org) {
+        membersWithRole(first: 100, after: $cursor) {
+          pageInfo { hasNextPage, endCursor }
+          nodes {
+            avatarUrl,
+            bio,
+            email @include(if: $email),
+            login,
+            name
+          }
+        }
+      }
+    }`;
+
+  // There is no user -> teams edge, so we leave the memberships empty for
+  // now and let the team iteration handle it instead
+  const mapper = (user: User) => {
+    const entity: UserEntity = {
+      apiVersion: 'backstage.io/v1alpha1',
+      kind: 'User',
+      metadata: {
+        name: user.login,
+        annotations: {
+          'github.com/user-login': user.login,
+        },
+      },
+      spec: {
+        profile: {},
+        memberOf: [],
+      },
+    };
+
+    if (user.bio) entity.metadata.description = user.bio;
+    if (user.name) entity.spec.profile!.displayName = user.name;
+    if (user.email) entity.spec.profile!.email = user.email;
+    if (user.avatarUrl) entity.spec.profile!.picture = user.avatarUrl;
+
+    return entity;
+  };
+
+  const users = await queryWithPaging(
+    client,
+    query,
+    r => r.organization?.membersWithRole,
+    mapper,
+    { org, email: tokenType === 'token' },
+  );
+
+  return { users };
+}
+
+/**
+ * Gets all the teams out of a GitHub organization.
+ *
+ * Note that the teams will not have any relations apart from parent filled in.
+ *
+ * @param client An octokit graphql client
+ * @param org The slug of the org to read
+ */
+export async function getOrganizationTeams(
+  client: typeof graphql,
+  org: string,
+  orgNamespace?: string,
+): Promise<{
+  groups: GroupEntity[];
+  groupMemberUsers: Map<string, string[]>;
+}> {
+  const query = `
+    query teams($org: String!, $cursor: String) {
+      organization(login: $org) {
+        teams(first: 100, after: $cursor) {
+          pageInfo { hasNextPage, endCursor }
+          nodes {
+            slug
+            combinedSlug
+            name
+            description
+            avatarUrl
+            parentTeam { slug }
+            members(first: 100, membership: IMMEDIATE) {
+              pageInfo { hasNextPage }
+              nodes { login }
+            }
+          }
+        }
+      }
+    }`;
+
+  // Gets populated inside the mapper below
+  const groupMemberUsers = new Map<string, string[]>();
+
+  const mapper = async (team: Team) => {
+    const entity: GroupEntity = {
+      apiVersion: 'backstage.io/v1alpha1',
+      kind: 'Group',
+      metadata: {
+        name: team.slug,
+        annotations: {
+          'github.com/team-slug': team.combinedSlug,
+        },
+      },
+      spec: {
+        type: 'team',
+        profile: {},
+        children: [],
+      },
+    };
+
+    if (orgNamespace) {
+      entity.metadata.namespace = orgNamespace;
+    }
+
+    if (team.description) {
+      entity.metadata.description = team.description;
+    }
+    if (team.name) {
+      entity.spec.profile!.displayName = team.name;
+    }
+    if (team.avatarUrl) {
+      entity.spec.profile!.picture = team.avatarUrl;
+    }
+    if (team.parentTeam) {
+      entity.spec.parent = team.parentTeam.slug;
+    }
+
+    const memberNames: string[] = [];
+    const groupKey = orgNamespace ? `${orgNamespace}/${team.slug}` : team.slug;
+    groupMemberUsers.set(groupKey, memberNames);
+
+    if (!team.members.pageInfo.hasNextPage) {
+      // We got all the members in one go, run the fast path
+      for (const user of team.members.nodes) {
+        memberNames.push(user.login);
+      }
+    } else {
+      // There were more than a hundred immediate members - run the slow
+      // path of fetching them explicitly
+      const { members } = await getTeamMembers(client, org, team.slug);
+      for (const userLogin of members) {
+        memberNames.push(userLogin);
+      }
+    }
+
+    return entity;
+  };
+
+  const groups = await queryWithPaging(
+    client,
+    query,
+    r => r.organization?.teams,
+    mapper,
+    { org },
+  );
+
+  return { groups, groupMemberUsers };
+}
+
+/**
+ * Gets all the users out of a GitHub organization.
+ *
+ * Note that the users will not have their memberships filled in.
+ *
+ * @param client An octokit graphql client
+ * @param org The slug of the org to read
+ * @param teamSlug The slug of the team to read
+ */
+export async function getTeamMembers(
+  client: typeof graphql,
+  org: string,
+  teamSlug: string,
+): Promise<{ members: string[] }> {
+  const query = `
+    query members($org: String!, $teamSlug: String!, $cursor: String) {
+      organization(login: $org) {
+        team(slug: $teamSlug) {
+          members(first: 100, after: $cursor, membership: IMMEDIATE) {
+            pageInfo { hasNextPage, endCursor }
+            nodes { login }
+          }
+        }
+      }
+    }`;
+
+  const members = await queryWithPaging(
+    client,
+    query,
+    r => r.organization?.team?.members,
+    user => user.login,
+    { org, teamSlug },
+  );
+
+  return { members };
 }

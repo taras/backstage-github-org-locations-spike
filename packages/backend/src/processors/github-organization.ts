@@ -4,16 +4,24 @@ import { LocationSpec } from '@backstage/catalog-model';
 import {
   CatalogProcessor,
   CatalogProcessorEmit,
-  GithubOrgReaderProcessor,
   results,
 } from '@backstage/plugin-catalog-backend';
 import { Logger } from 'winston';
-import { createGitHubClient, getGitHubConfig, getOrganizationRepositories } from '../clients/github';
+import {
+  buildOrgHierarchy,
+  createGitHubClient,
+  getGitHubConfig,
+  getGitHubCredentials,
+  getOrganizationRepositories,
+  getOrganizationTeams,
+  getOrganizationUsers,
+  GitHubCredentials,
+  GraphQL,
+} from '../clients/github';
 
 export class GitHubOrganizationProcessor implements CatalogProcessor {
   private readonly integrations: ScmIntegrations;
   private readonly logger: Logger;
-  private readonly githubOrgReaderProcessor: GithubOrgReaderProcessor;
 
   static fromConfig(
     config: Config,
@@ -22,21 +30,12 @@ export class GitHubOrganizationProcessor implements CatalogProcessor {
     return new GitHubOrganizationProcessor({
       ...options,
       integrations: ScmIntegrations.fromConfig(config),
-      githubOrgReaderProcessor: GithubOrgReaderProcessor.fromConfig(
-        config,
-        options,
-      ),
     });
   }
 
-  constructor(options: {
-    integrations: ScmIntegrations;
-    logger: Logger;
-    githubOrgReaderProcessor: GithubOrgReaderProcessor;
-  }) {
+  constructor(options: { integrations: ScmIntegrations; logger: Logger }) {
     this.integrations = options.integrations;
     this.logger = options.logger;
-    this.githubOrgReaderProcessor = options.githubOrgReaderProcessor;
   }
 
   async readLocation(
@@ -58,27 +57,28 @@ export class GitHubOrganizationProcessor implements CatalogProcessor {
 
     const gitHubConfig = getGitHubConfig(this.integrations, orgUrl);
 
-    // TODO: confirm that this will use GitHub App when available
-    const client = await createGitHubClient(orgUrl, gitHubConfig);
+    const credentials = await getGitHubCredentials(orgUrl, gitHubConfig);
 
-    // Read out all of the raw data
-    const startTimestamp = Date.now();
-  
-    this.logger.info(`Reading GitHub repositories from ${location.target}`);
+    const client: GraphQL = await createGitHubClient(gitHubConfig, credentials);
 
-    const { repositories } = await getOrganizationRepositories(client, org);
+    const { groups } = await retrieveGroups({
+      org,
+      client,
+      logger: this.logger,
+      tokenType: credentials.type
+    });
 
-    const matching = repositories.filter(
-      r => !r.isArchived,
-    );
+    for (const group of groups) {
+      emit(results.entity(location, group));
+    }
 
-    const duration = ((Date.now() - startTimestamp) / 1000).toFixed(1);
+    const repositories = await retrieveRepositories({
+      org,
+      client,
+      logger: this.logger,
+    });
 
-    this.logger.debug(
-      `Read ${repositories.length} GitHub repositories (${matching.length} matching the pattern) in ${duration} seconds`,
-    );
-
-    for (const repository of matching) {
+    for (const repository of repositories) {
       emit(
         results.location(
           {
@@ -94,12 +94,96 @@ export class GitHubOrganizationProcessor implements CatalogProcessor {
   }
 }
 
+async function retrieveRepositories({
+  org,
+  client,
+  logger,
+}: {
+  org: string;
+  client: GraphQL;
+  logger: Logger;
+}) {
+  // Read out all of the raw data
+  const startTimestamp = Date.now();
+
+  logger.info(`Reading GitHub repositories from org: ${org}`);
+
+  const { repositories } = await getOrganizationRepositories(client, org);
+
+  const matching = repositories.filter(r => !r.isArchived);
+
+  const duration = ((Date.now() - startTimestamp) / 1000).toFixed(1);
+
+  logger.debug(
+    `Read ${repositories.length} GitHub repositories (${matching.length} matching the pattern) in ${duration} seconds`,
+  );
+
+  return repositories;
+}
+
+async function retrieveGroups({
+  org,
+  client,
+  logger,
+  tokenType
+}: {
+  org: string;
+  client: GraphQL;
+  logger: Logger;
+  tokenType: GitHubCredentials['type']
+}) {
+  const startTimestamp = Date.now();
+  
+  logger.info(
+    `Reading GitHub users and teams for org: ${org}`,
+  );
+
+  const { users } = await getOrganizationUsers(
+    client,
+    org,
+    tokenType
+  );
+  
+  const { groups, groupMemberUsers } = await getOrganizationTeams(
+    client,
+    org,
+    "default",
+  );
+
+  const duration = ((Date.now() - startTimestamp) / 1000).toFixed(1);
+  
+  logger.debug(
+    `Read ${users.length} GitHub users and ${groups.length} GitHub teams from ${org} in ${duration} seconds`,
+  );
+
+  const allUsersMap = new Map();
+
+  users.forEach(u => {
+    if (!allUsersMap.has(u.metadata.name)) {
+      allUsersMap.set(u.metadata.name, u);
+    }
+  });
+
+  for (const [groupName, userNames] of groupMemberUsers.entries()) {
+    for (const userName of userNames) {
+      const user = allUsersMap.get(userName);
+      if (user && !user.spec.memberOf.includes(groupName)) {
+        user.spec.memberOf.push(groupName);
+      }
+    }
+  }
+  
+  buildOrgHierarchy(groups);
+
+  return { groups, users };
+}
+
 function getOrgFromUrl(urlString: string) {
   const url = new URL(urlString);
   const path = url.pathname.substr(1).split('/');
 
   return {
     org: decodeURIComponent(path[0]),
-    isOrgUrl: path.length === 1
-  }
+    isOrgUrl: path.length === 1,
+  };
 }
